@@ -5,3 +5,9 @@ __pycache__/
 *.egg-info
 MUJOCO_LOG.TXT
 ;
+
+# Reward-Event Contrastive Reconstruction: CPU verification artifacts
+.venv_rer/
+rer_*.log
+rer_maps/
+logdir*/
