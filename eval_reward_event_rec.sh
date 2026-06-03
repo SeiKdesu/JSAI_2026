@@ -94,7 +94,7 @@ resolve_checkpoint() {
 
 # ---- eval 実行 ---------------------------------------------------------------
 run_eval() {
-  local run_name="$1"
+  local run_name="$1"; shift
   local ckpt_path
   ckpt_path=$(resolve_checkpoint "${run_name}")
 
