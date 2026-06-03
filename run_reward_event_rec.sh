@@ -170,9 +170,24 @@ case "${RUNMODE}" in
     launch "proposed" True "$@"
     ;;
 
+  proposed_400k)
+    # DyMoDreamer / Atari 100k 比較用: 400k raw frames = 100k agent steps
+    # ログ上の step=400000 に対応 (multiplier=4 でログ出力されるため)。
+    # save_every=120 (秒) で最終 checkpoint を 400k 直前に保存する。
+    STEPS=1e5
+    launch "proposed_400k" True --run.save_every 120 "$@"
+    ;;
+
+  baseline_400k)
+    # DyMoDreamer / Atari 100k 比較用 baseline: 提案手法を無効化した純 DreamerV3。
+    # proposed_400k と同一 seed・同一環境設定で実行すること。
+    STEPS=1e5
+    launch "baseline_400k" False --run.save_every 120 "$@"
+    ;;
+
   *)
     echo "Unknown run mode: ${RUNMODE}" >&2
-    echo "Usage: $0 {smoke|proposed|baseline|ablation}" >&2
+    echo "Usage: $0 {smoke|proposed|baseline|ablation|proposed_400k|baseline_400k}" >&2
     exit 1
     ;;
 esac
