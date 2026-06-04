@@ -59,6 +59,7 @@ PLATFORM="${PLATFORM:-cuda}"   # cpu / cuda / tpu
 
 # ---- reward_event_rec ハイパーパラメータ (環境変数で上書き可) ----------------
 REC_MODE="${REC_MODE:-mult}"           # mult (確定版, rec本体を再配分) / aux (旧 additive)
+PRIOR_EMA="${PRIOR_EMA:-True}"         # True: priorをバッチ横断EMA蓄積 (update_rate使用, gateは累積イベント数で発火) / False: 旧 per-batch
 BLEND="${BLEND:-1.0}"                  # mult: 再配分強度 W_eff = 1 + blend·(W~-1)
 SCALE="${SCALE:-0.05}"                 # aux のみ: 加算 event_rec の loss scale
 ALPHA="${ALPHA:-2.0}"
@@ -83,6 +84,7 @@ rer_flags() {
   local enable="$1"
   printf '%s ' \
     "--agent.reward_event_rec.enable" "${enable}" \
+    "--agent.reward_event_rec.prior_ema" "${PRIOR_EMA}" \
     "--agent.reward_event_rec.mode" "${REC_MODE}" \
     "--agent.reward_event_rec.blend" "${BLEND}" \
     "--agent.reward_event_rec.scale" "${SCALE}" \
