@@ -21,6 +21,174 @@ concat = lambda xs, a: jax.tree.map(lambda *x: jnp.concatenate(x, a), *xs)
 isimage = lambda s: s.dtype == np.uint8 and len(s.shape) == 3
 
 
+def _normalize_map(m, cfg):
+  if cfg.normalize == 'mean':
+    denom = m.mean()
+  else:  # percentile
+    denom = jnp.percentile(m, cfg.percentile)
+  return m / jnp.maximum(denom, 1e-8)
+
+
+def _event_base_means(image, reward, cfg):
+  """Per-batch raw motion statistics split by reward / non-reward steps.
+
+  Args:
+    image: float32 array (B, T, H, W, C) scaled to [0, 1].
+    reward: float32 array (B, T).
+    cfg: reward_event_rec config block.
+
+  Returns:
+    event_mean, base_mean: (H, W) mean windowed motion at reward / non-reward
+      steps (raw, before HUD penalty and normalization).
+    motion_map, diff_map: (H, W) naive aggregate maps for visualization.
+    event_count, base_count: scalar counts of reward / non-reward steps.
+  """
+  B, T, H, W, C = image.shape
+
+  # D_t = |x_t - x_{t-1}| reduced over channels; D_0 = 0.
+  diff = jnp.abs(image[:, 1:] - image[:, :-1])
+  diff = jnp.concatenate([jnp.zeros_like(image[:, :1]), diff], 1)
+  D = diff.mean(-1)  # (B, T, H, W)
+
+  # M_t = max over the past `window` frames (tau in [-K, 0]).
+  window = max(1, int(cfg.window))
+  M = D
+  for k in range(1, window):
+    shifted = jnp.pad(D, [(0, 0), (k, 0), (0, 0), (0, 0)])[:, :T]
+    M = jnp.maximum(M, shifted)
+
+  event = (jnp.abs(reward) > 0).astype(f32)  # (B, T)
+  base = 1.0 - event
+  event_count = event.sum()
+  base_count = base.sum()
+  ew = event[:, :, None, None]
+  bw = base[:, :, None, None]
+  event_mean = (M * ew).sum((0, 1)) / jnp.maximum(event_count, 1.0)  # (H, W)
+  base_mean = (M * bw).sum((0, 1)) / jnp.maximum(base_count, 1.0)  # (H, W)
+
+  diff_map = D.mean((0, 1))  # (H, W) raw frame difference
+  motion_map = M.mean((0, 1))  # (H, W) windowed motion saliency (all frames)
+  return event_mean, base_mean, motion_map, diff_map, event_count, base_count
+
+
+def _means_to_weight(event_mean, base_mean, cfg, H, W):
+  """Turn (event_mean, base_mean) into the reconstruction weight + raw prior.
+
+  Identical math whether the means are a single batch (per-batch mode) or the
+  cross-batch EMA accumulation (prior_ema mode); keeping it in one place means
+  both paths normalize and clip exactly the same way.
+  """
+  prior = jax.nn.relu(event_mean - cfg.beta * base_mean)  # (H, W)
+  # Down-weight the top HUD strip used by Atari score/lives displays.
+  hud_h = int(round(cfg.hud_height_ratio * H))
+  if hud_h > 0:
+    hud = jnp.ones((H, W), f32).at[:hud_h, :].set(cfg.hud_penalty)
+    prior = prior * hud
+  prior_n = _normalize_map(prior, cfg)
+  weight = jnp.clip(1.0 + cfg.alpha * prior_n, cfg.clip_min, cfg.clip_max)
+  return jax.lax.stop_gradient(weight), prior
+
+
+def reward_event_prior(image, reward, cfg):
+  """Per-batch Reward-Event Contrastive prior over the image plane.
+
+  Builds a non-learned spatial map that highlights regions which change
+  specifically around reward events, relative to non-reward times. This is the
+  stateless per-batch estimate; the EMA accumulation (prior_ema mode) lives in
+  RerPriorEMA and reuses _event_base_means / _means_to_weight.
+
+  Returns:
+    weight: (H, W) stop-gradient reconstruction weight in [clip_min, clip_max].
+    prior: (H, W) raw ReLU(event_mean - beta * base_mean) before normalize.
+    motion_weight: (H, W) naive motion-only weight (no contrast, no HUD penalty)
+      shown for comparison; this is what a pure frame-difference mask produces.
+    diff_map: (H, W) raw mean frame difference D_t averaged over batch/time.
+    event_count, base_count: scalar counts of reward / non-reward steps.
+    gate: scalar 1.0 if event_count >= min_event_count else 0.0.
+  """
+  B, T, H, W, C = image.shape
+  event_mean, base_mean, motion_map, diff_map, ecount, bcount = (
+      _event_base_means(image, reward, cfg))
+  weight, prior = _means_to_weight(event_mean, base_mean, cfg, H, W)
+
+  # Naive motion-only weight (DyMoDreamer-like): no event/base contrast and no
+  # HUD penalty, so it also lights up the HUD and global background motion.
+  motion_n = _normalize_map(motion_map, cfg)
+  motion_weight = jnp.clip(
+      1.0 + cfg.alpha * motion_n, cfg.clip_min, cfg.clip_max)
+  motion_weight = jax.lax.stop_gradient(motion_weight)
+
+  gate = (ecount >= cfg.min_event_count).astype(f32)
+  return (weight, prior, motion_weight, diff_map, ecount, bcount, gate)
+
+
+class RerPriorEMA(nj.Module):
+  """Cross-batch EMA of the reward-event motion statistics.
+
+  The per-batch prior averages M over only the handful of reward steps in one
+  batch (~3-12 for Breakout/size25m), so it is very noisy and the min_event
+  gate almost never opens. This accumulates event_mean / base_mean across train
+  steps (the previously-unused `update_rate`), giving a stable prior even when
+  each batch contributes few events, and gates on the cumulative count seen.
+  """
+
+  rate: float = 0.01
+
+  def __init__(self, shape):
+    self.emean = nj.Variable(jnp.zeros, shape, f32, name='emean')
+    self.bmean = nj.Variable(jnp.zeros, shape, f32, name='bmean')
+    self.ecorr = nj.Variable(jnp.zeros, (), f32, name='ecorr')  # debias
+    self.seen = nj.Variable(jnp.zeros, (), f32, name='seen')  # cumulative events
+
+  def update(self, event_mean, base_mean, ecount):
+    r = self.rate
+    g = (ecount >= 1).astype(f32)
+    # Base steps are plentiful every batch -> always update.
+    self.bmean.write((1 - r) * self.bmean.read() + r * sg(base_mean))
+    # Event steps may be absent -> only fold in batches that saw an event, so
+    # empty batches do not drag the estimate toward zero.
+    new_e = (1 - r) * self.emean.read() + r * sg(event_mean)
+    self.emean.write(jnp.where(g > 0, new_e, self.emean.read()))
+    new_c = (1 - r) * self.ecorr.read() + r
+    self.ecorr.write(jnp.where(g > 0, new_c, self.ecorr.read()))
+    self.seen.write(self.seen.read() + sg(f32(ecount)))
+
+  def stats(self):
+    # Debias the event mean (zero init) like embodied.jax.Normalize does.
+    corr = jnp.maximum(self.rate, self.ecorr.read())
+    return sg(self.emean.read() / corr), sg(self.bmean.read())
+
+  def count(self):
+    return self.seen.read()
+
+
+def _gray_to_rgb(m):
+  """Min-max normalize a (H, W) map to a (H, W, 3) uint8 grayscale image."""
+  lo, hi = m.min(), m.max()
+  n = (m - lo) / jnp.maximum(hi - lo, 1e-8)
+  u = (jnp.clip(n, 0, 1) * 255).astype(jnp.uint8)
+  return jnp.repeat(u[..., None], 3, -1)
+
+
+def _weight_to_rgb(w, lo, hi):
+  """Map a weight (H, W) in [lo, hi] to a (H, W, 3) uint8 grayscale image."""
+  span = max(float(hi) - float(lo), 1e-8)
+  n = jnp.clip((w - lo) / span, 0, 1)
+  u = (n * 255).astype(jnp.uint8)
+  return jnp.repeat(u[..., None], 3, -1)
+
+
+def _overlay(sample01, w):
+  """Overlay weight (H, W) as a red heat on a grayscale frame (H, W, C)->RGB."""
+  gray = sample01.mean(-1)  # (H, W), robust to any channel count
+  base = gray * 0.6
+  lo, hi = w.min(), w.max()
+  hn = (w - lo) / jnp.maximum(hi - lo, 1e-8)
+  red = jnp.maximum(base, hn)
+  rgb = jnp.stack([red, base, base], -1)
+  return (jnp.clip(rgb, 0, 1) * 255).astype(jnp.uint8)
+
+
 class Agent(embodied.jax.Agent):
 
   banner = [
@@ -80,7 +248,21 @@ class Agent(embodied.jax.Agent):
     scales = self.config.loss_scales.copy()
     rec = scales.pop('rec')
     scales.update({k: rec for k in dec_space})
+    rercfg = self.config.reward_event_rec
+    if rercfg.enable and rercfg.mode == 'aux':
+      scales['event_rec'] = rercfg.scale
     self.scales = scales
+
+    # Cross-batch EMA accumulators for the reward-event prior (one per image
+    # key). Only built when the method and EMA mode are both enabled, so the
+    # baseline (enable=False) creates no extra state.
+    self.rer_ema = {}
+    if rercfg.enable and rercfg.prior_ema:
+      for key, space in obs_space.items():
+        if key in dec_space and isimage(space):
+          H, W = space.shape[0], space.shape[1]
+          self.rer_ema[key] = RerPriorEMA(
+              (H, W), rate=rercfg.update_rate, name=f'rer_ema_{key}')
 
   @property
   def policy_keys(self):
@@ -181,6 +363,93 @@ class Agent(embodied.jax.Agent):
       target = f32(value) / 255 if isimage(space) else value
       losses[key] = recon.loss(sg(target))
 
+    # Reward-Event Contrastive Reconstruction (auxiliary, global prior version).
+    report_outs = {}
+    recfg = self.config.reward_event_rec
+    if recfg.enable:
+      mult = (recfg.mode == 'mult')
+      event_rec = jnp.zeros((B, T), f32)
+      imgkeys = [k for k in self.dec.imgkeys if k in recons]
+      primary = imgkeys[0] if imgkeys else None
+      for key in imgkeys:
+        image = f32(obs[key]) / 255  # (B, T, H, W, C) in [0, 1]
+        pred = recons[key].pred()  # raw decoder mean, same [0, 1] scale
+        H, W = image.shape[2], image.shape[3]
+        # Per-batch raw statistics (always computed for metrics / fallback).
+        em, bm, motion_map, diff_map, ecount, bcount = (
+            _event_base_means(image, obs['reward'], recfg))
+        ema = self.rer_ema.get(key)
+        if ema is not None:
+          # EMA mode: accumulate across train steps, weight from the stable
+          # estimate, and gate on the cumulative number of events seen.
+          if training:
+            ema.update(em, bm, ecount)
+          em_use, bm_use = ema.stats()
+          gate = (ema.count() >= recfg.min_event_count).astype(f32)
+        else:
+          # Per-batch mode: estimate and gate from this batch alone.
+          em_use, bm_use = em, bm
+          gate = (ecount >= recfg.min_event_count).astype(f32)
+        weight, prior = _means_to_weight(em_use, bm_use, recfg, H, W)
+        motion_n = _normalize_map(motion_map, recfg)
+        motion_weight = sg(jnp.clip(
+            1.0 + recfg.alpha * motion_n, recfg.clip_min, recfg.clip_max))
+        sqerr = jnp.square(pred - sg(image))
+        uniform_key_loss = sqerr.sum((-1, -2, -3))  # standard rec (B, T)
+        # A3: mean-1 normalized weight -> pure spatial redistribution, so the
+        # total reconstruction magnitude is preserved (no confound with simply
+        # scaling up the rec loss). gate/blend fall back to uniform safely.
+        wtilde = weight / jnp.maximum(weight.mean(), 1e-8)  # (H, W), mean 1
+        w_eff = 1.0 + gate * recfg.blend * (wtilde - 1.0)
+        w_eff = sg(w_eff)
+        weighted_key_loss = (
+            sqerr * w_eff[None, None, :, :, None]).sum((-1, -2, -3))
+        if mult:
+          # A2: reweight the standard image rec loss in place (no extra term).
+          losses[key] = weighted_key_loss
+        else:
+          # Legacy additive auxiliary term at `scale` (uses raw weight, gated).
+          event_rec = event_rec + (
+              sqerr * weight[None, None, :, :, None]).sum((-1, -2, -3)) * gate
+        if key == primary:
+          applied = w_eff if mult else (weight * gate + (1.0 - gate))
+          metrics['reward_event/event_count'] = ecount
+          metrics['reward_event/base_count'] = bcount
+          metrics['reward_event/prior_mean'] = prior.mean()
+          metrics['reward_event/prior_max'] = prior.max()
+          metrics['reward_event/weight_mean'] = applied.mean()
+          metrics['reward_event/weight_max'] = applied.max()
+          metrics['reward_event/motion_weight_mean'] = motion_weight.mean()
+          metrics['reward_event/enabled'] = gate
+          # Redistribution effect: >1 means the reward region is currently
+          # reconstructed worse than average (the term the method targets).
+          metrics['reward_event/weighted_over_uniform'] = (
+              weighted_key_loss.mean() / jnp.maximum(
+                  uniform_key_loss.mean(), 1e-8))
+          metrics['reward_event/loss'] = (
+              weighted_key_loss if mult else event_rec).mean()
+          # Maps are only consumed by report(); skip the work during training.
+          if recfg.log_maps and not training:
+            # Pick a real frame at the first reward event for the overlay.
+            ev = (jnp.abs(obs['reward']) > 0).reshape(-1)
+            idx = jnp.argmax(ev)
+            sample01 = image[idx // T, idx % T]  # (H, W, C) in [0, 1]
+            diff_img = _gray_to_rgb(diff_map)
+            motion_img = _gray_to_rgb(motion_weight)
+            prior_img = _gray_to_rgb(prior)
+            weight_img = _gray_to_rgb(applied)
+            overlay_img = _overlay(sample01, applied)
+            report_outs['reward_event/diff_map'] = diff_img
+            report_outs['reward_event/motion_weight_map'] = motion_img
+            report_outs['reward_event/prior_map'] = prior_img
+            report_outs['reward_event/weight_map'] = weight_img
+            report_outs['reward_event/overlay'] = overlay_img
+            # Side-by-side panel: diff | motion | prior | weight | overlay.
+            report_outs['reward_event/panel'] = jnp.concatenate(
+                [diff_img, motion_img, prior_img, weight_img, overlay_img], 1)
+      if not mult:
+        losses['event_rec'] = event_rec
+
     B, T = reset.shape
     shapes = {k: v.shape for k, v in losses.items()}
     assert all(x == (B, T) for x in shapes.values()), ((B, T), shapes)
@@ -239,9 +508,23 @@ class Agent(embodied.jax.Agent):
     metrics.update({f'loss/{k}': v.mean() for k, v in losses.items()})
     loss = sum([v.mean() * self.scales[k] for k, v in losses.items()])
 
+    # Relative magnitude of the auxiliary event reconstruction loss.
+    if self.config.reward_event_rec.enable and 'event_rec' in losses:
+      scaled_event_rec = losses['event_rec'].mean() * self.scales['event_rec']
+      imgkeys = [k for k in self.dec.imgkeys if k in losses]
+      scaled_image_rec = sum(
+          losses[k].mean() * self.scales[k] for k in imgkeys)
+      total_before = loss - scaled_event_rec
+      metrics['reward_event/scaled_loss'] = scaled_event_rec
+      metrics['reward_event/scale_ratio_to_rec'] = (
+          scaled_event_rec / jnp.maximum(scaled_image_rec, 1e-8))
+      metrics['reward_event/scale_ratio_to_total'] = (
+          scaled_event_rec / jnp.maximum(total_before, 1e-8))
+
     carry = (enc_carry, dyn_carry, dec_carry)
     entries = (enc_entries, dyn_entries, dec_entries)
     outs = {'tokens': tokens, 'repfeat': repfeat, 'losses': losses}
+    outs.update(report_outs)
     return loss, (carry, entries, outs, metrics)
 
   def report(self, carry, data):
@@ -258,6 +541,9 @@ class Agent(embodied.jax.Agent):
     _, (new_carry, entries, outs, mets) = self.loss(
         carry, obs, prevact, training=False)
     mets.update(mets)
+    for k, v in outs.items():
+      if k.startswith('reward_event/'):
+        metrics[k] = v
 
     # Grad norms
     if self.config.report_gradnorms:
@@ -285,6 +571,36 @@ class Agent(embodied.jax.Agent):
     dec_carry, _, imgrecons = self.dec(
         dec_carry, imgfeat, jnp.zeros_like(secondhalf(obs['is_first'])),
         training=False)
+
+    # Region-decomposed reconstruction probe (independent of enable so the
+    # baseline and the proposed method are measured the same way). Measures how
+    # well the observed-half reconstruction matches the true frames inside the
+    # reward-event region versus the background.
+    recfg = self.config.reward_event_rec
+    for key in self.dec.imgkeys:
+      image = f32(obs[key]) / 255  # (B, T, H, W, C)
+      ema = self.rer_ema.get(key)
+      if ema is not None:
+        # Use the accumulated EMA prior (read-only) so the region matches what
+        # the loss actually weighted.
+        em_use, bm_use = ema.stats()
+        _, prior = _means_to_weight(
+            em_use, bm_use, recfg, image.shape[2], image.shape[3])
+      else:
+        _, prior, _, _, _, _, _ = reward_event_prior(
+            image, obs['reward'], recfg)
+      thresh = jnp.percentile(prior, recfg.percentile)
+      region = (prior > jnp.maximum(thresh, 1e-6)).astype(f32)  # (H, W)
+      true = image[:RB, :T // 2]
+      pred = obsrecons[key].pred()
+      err = jnp.square(pred - true).mean(-1)  # (RB, T//2, H, W)
+      reg = region[None, None]
+      ev = (err * reg).sum((-1, -2)) / jnp.maximum(region.sum(), 1.0)
+      bg = (err * (1 - reg)).sum((-1, -2)) / jnp.maximum((1 - region).sum(), 1.0)
+      metrics['reward_event/recon_mse_event_region'] = ev.mean()
+      metrics['reward_event/recon_mse_bg_region'] = bg.mean()
+      metrics['reward_event/recon_mse_region_over_bg'] = (
+          ev.mean() / jnp.maximum(bg.mean(), 1e-8))
 
     # Video preds
     for key in self.dec.imgkeys:

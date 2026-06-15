@@ -116,6 +116,24 @@ defaults:
     repval_grad: True
     report: True
     report_gradnorms: False
+    reward_event_rec:
+      enable: False
+      prior_ema: True  # accumulate event/base motion stats across batches (uses update_rate); gate then triggers on cumulative event count. False = stateless per-batch prior.
+      mode: mult  # "mult" (reweight image rec body, mean-1 normalized) or "aux" (additive term)
+      blend: 1.0  # mult mode: redistribution strength, W_eff = 1 + blend*(W~ - 1)
+      scale: 0.05  # aux mode only: additive event_rec loss scale
+      alpha: 2.0
+      beta: 1.0
+      window: 5
+      min_event_count: 20
+      normalize: percentile  # mean or percentile
+      percentile: 95
+      hud_penalty: 0.1
+      hud_height_ratio: 0.15
+      update_rate: 0.01
+      clip_min: 1.0
+      clip_max: 5.0
+      log_maps: True
 
 size1m: &size1m
   .*\.rssm: {deter: 512, hidden: 64, classes: 4}
