@@ -1,105 +1,150 @@
-# Mastering Diverse Domains through World Models + RER
+# 報酬関連領域を強調した Dreamer V3 の表現学習
 
-This repository contains a reimplementation of [DreamerV3][paper] enhanced with **Reward-Event Contrastive Reconstruction (RER)**. DreamerV3 is a scalable reinforcement learning algorithm that masters diverse applications with fixed hyperparameters. RER is a proposed extension that improves learning efficiency by spatially reallocating reconstruction loss to reward-relevant regions.
+## 概要
 
-![DreamerV3 Tasks](https://user-images.githubusercontent.com/2111293/217647148-cbc522e2-61ad-4553-8e14-1ecdc8d9438b.gif)
+本研究は、Dreamer V3 の World Model における画像再構成学習に対して、報酬に関連する視覚領域を重点的に学習させる手法を提案する。  
+従来の画像再構成 loss は全ピクセルを一様に扱うため、報酬獲得に重要な小物体・接触領域・衝突箇所などが背景再構成に埋もれる可能性がある。  
+そこで、報酬発生時の画像変化と通常時の画像変化を比較し、報酬に連動して変化する領域を強調した重み付き再構成 loss を導入する。
 
-## Reward-Event Contrastive Reconstruction (RER)
+## 背景
 
-Standard DreamerV3 applies uniform reconstruction loss across all pixels. In many environments (like Atari Breakout), reward-relevant objects like balls or bullets are tiny and their reconstruction loss is easily overwhelmed by the background.
+### World Model
 
-**RER** addresses this by:
-1.  **Extracting Reward-Event Priors**: Automatically identifying regions that change specifically during reward events compared to non-rewarding transitions.
-2.  **Spatial Loss Reallocation**: Weighting the reconstruction loss so the model focuses its capacity on these critical regions.
-3.  **Total Loss Preservation**: Normalizing weights to ensure the total reconstruction loss remains consistent with the baseline, avoiding confounding effects from simply increasing the loss scale.
+World Model は、観測情報に基づいてエージェントを取り巻く環境のモデルを学習する枠組みである。  
+エージェントは、学習した環境モデルを用いて将来の状態を予測し、その予測に基づいて行動を選択できる。
 
-Experiments on Breakout show that RER can reduce reconstruction MSE for reward-relevant objects by ~29% and leads to faster score improvements as the "gate" for RER opens (typically after ~20 reward events).
+### Dreamer V3
 
-## Instructions
+Dreamer V3 は、学習した World Model 内で未来を想像しながら方策を学習する強化学習モデルである。  
+主に以下の構成を持つ。
 
-The code requires Python 3.11+ and has been tested on Linux and macOS.
+- **World Model**: 観測画像を離散潜在表現 `z_t` にエンコードし、行動と過去の状態 `h_t` から未来の状態を予測する。
+- **Actor-Critic**: World Model が生成する状態系列から、行動方策と価値関数を学習する。
 
-### Setup
+## 問題設定
 
-Install dependencies:
+Dreamer V3 の画像再構成 loss は、画像全体のピクセルを一様に扱う。
 
-```sh
-pip install -U -r requirements.txt
+```math
+L_{rec} = \sum_{h,w,c} (\hat{x}_{t,h,w,c} - x_{t,h,w,c})^2
 ```
 
-### Running Experiments
+この場合、報酬に重要な領域が画像内で小さい場合、背景や報酬に無関係な領域の再構成が loss の大部分を占める。  
+その結果、行動決定に重要な視覚情報が潜在表現に十分保持されない可能性がある。
 
-Use the provided helper script to run RER experiments or baselines:
+## 研究目的
 
-```sh
-# Smoke test (CPU, debug config, verify shape/logging)
-./run_reward_event_rec.sh smoke
+Dreamer V3 における画像の再構成学習において、報酬関連領域を重点的に学習する。  
+これにより、行動決定に有用な視覚情報を潜在表現に保持しやすくすることを目的とする。
 
-# Run Proposed Method (RER enabled)
-./run_reward_event_rec.sh proposed
+## 提案手法
 
-# Run Baseline (Standard DreamerV3)
-./run_reward_event_rec.sh baseline
+提案手法では、報酬発生時に特徴的に変化する領域を推定し、その領域に大きな重みを与えた再構成 loss を用いる。
 
-# Run Ablation (Baseline followed by Proposed on same seed)
-./run_reward_event_rec.sh ablation
+### Step 1: 報酬イベントの抽出
+
+報酬が発生した時刻を **event**、それ以外の時刻を **non-event** として扱う。
+
+例:
+
+| 時刻 | 状態 |
+|---|---|
+| `t-2` | non-event |
+| `t-1` | non-event |
+| `t` | event |
+| `t+1` | non-event |
+
+### Step 2: 各フレームの画像変化を計算
+
+連続する観測画像の差分から、フレームごとの変化マップ `D_t` を作成する。
+
+```math
+D_t = mean_c |x_t - x_{t-1}|
 ```
 
-You can override parameters via environment variables:
-```sh
-TASK=atari_pong SEED=1 ./run_reward_event_rec.sh proposed
+ここで、`mean_c` はチャネル方向の平均を表す。  
+この差分マップにより、ボールの移動、ブロックとの衝突、物体の位置変化などを捉える。
+
+### Step 3: event と non-event の差分を比較
+
+event 時の平均変化マップ `D_event` と、non-event 時の平均変化マップ `D_non-event` を比較する。
+
+```math
+S = ReLU(D_{event} - D_{non-event})
 ```
 
-### Hardware Constraints & Optimization
+この `S` は、報酬時に通常時よりも大きく変化した領域を表す。
 
-If running on older GPUs like **RTX 1080 Ti** (Pascal architecture), use these flags to avoid OOM and compatibility issues:
-- `--jax.compute_dtype float32` (Pascal doesn't support bfloat16 hardware acceleration)
-- `--jax.prealloc False`
-- `--batch_size 8` (or lower)
+- 正の値: 報酬時の動き > 平常時の動き  
+  → 報酬連動領域として残す
+- 負の値: 報酬時の動き < 平常時の動き  
+  → 報酬時に動かない領域として 0 にクリップ
 
-These are automatically handled if you use the default settings in `run_reward_event_rec.sh` or can be added to your manual command.
+### 重み付き再構成 loss
 
-### Visualization & Analysis
+推定した重要領域を用いて、画像再構成 loss に空間的な重みを導入する。
 
-- **Scope**: View scalar metrics and images.
-  ```sh
-  pip install -U scope
-  python -m scope.viewer --basedir ~/logdir/reward_event_rec --port 8000
-  ```
-- **RER Maps**: If `log_maps=True`, RER-specific heatmaps (`base_map`, `event_map`, `prior`) are logged to help verify spatial focusing.
-- **Verification Scripts**:
-  - `rer_visualize.py`: Visualize the RER heatmaps and loss distributions.
-  - `verify_reward_event_rec.py`: Unit tests for the RER logic.
-
-## Repository Structure
-
-- `dreamerv3/`: Core algorithm code.
-  - `agent.py`: Contains the RER implementation (search for `reward_event_rec`).
-  - `configs.yaml`: Default hyperparameters.
-- `embodied/`: Environment wrappers and infrastructure.
-- `rer_*.py`: Scripts for RER-specific experiments, ablations, and visualization.
-- `verify_*.py`: Verification and debugging scripts.
-- `run_reward_event_rec.sh`: Main entry point for experiments.
-
-## Citation
-
-If you find the DreamerV3 implementation useful, please cite the original paper:
-
-```
-@article{hafner2025dreamerv3,
-  title={Mastering diverse control tasks through world models},
-  author={Hafner, Danijar and Pasukonis, Jurgis and Ba, Jimmy and Lillicrap, Timothy},
-  journal={Nature},
-  pages={1--7},
-  year={2025},
-  publisher={Nature Publishing Group}
-}
+```math
+L_{w\_proposed}
+=
+\sum_{h,w} w_{eff}(h,w)
+\cdot
+\sum_c
+(\hat{x}_{t,h,w,c} - x_{t,h,w,c})^2
 ```
 
-## Disclaimer
+この loss により、報酬に関連する領域の再構成誤差がより強く学習され、重要情報を潜在表現に保持しやすくなる。
 
-This repository is a reimplementation and extension of DreamerV3 based on the open-source DreamerV2 codebase. It is unrelated to Google or DeepMind.
+## 実験設定
 
-[paper]: https://arxiv.org/pdf/2301.04104
-[website]: https://danijar.com/dreamerv3
-[tweet]: https://twitter.com/danijarh/status/1613161946223677441
+- **モデルサイズ**: 200M → 25M
+- **タスク**: Atari 環境
+  - Breakout
+  - Pong
+  - Seaquest
+
+## 実験結果
+
+### Atari の評価結果
+
+| Task | Baseline | Proposed | Δ |
+|---|---:|---:|---:|
+| Breakout | 8.89 | 9.95 | +11.9% |
+| Pong | 16.5 | 14.2 | −13.7% |
+| Seaquest | 408.6 | 694.4 | +69.9% |
+
+Breakout と Seaquest では提案手法が性能を改善した。  
+一方で、Pong では性能が低下しており、タスクによって報酬関連領域の強調が必ずしも有効ではない可能性がある。
+
+### World Model の報酬イベント MSE
+
+| Task | Baseline | Proposed | Δ |
+|---|---:|---:|---:|
+| Breakout | 0.902 | 0.357 | −60.4% |
+| Pong | 0.169 | 0.146 | −13.6% |
+| Seaquest | 1.33 | 1.26 | −5.5% |
+
+報酬イベントにおける World Model の MSE は、全タスクで低下した。  
+特に Breakout では大きく改善しており、報酬関連領域の再構成精度が向上したことが示唆される。
+
+## 考察
+
+提案手法は、報酬が発生する瞬間に特徴的な視覚変化を抽出し、その領域を World Model の再構成学習で強調する。  
+これにより、報酬獲得に関係する小物体や接触領域を潜在表現に保持しやすくなる。
+
+一方で、Pong のように評価スコアが低下するケースもある。  
+この結果から、報酬イベントの視覚的特徴がタスクごとに異なり、単純な差分ベースの重要領域推定だけでは不十分な場合があると考えられる。
+
+## 今後の課題
+
+- 報酬関連領域の推定方法をより安定化する
+- タスクごとに適切な重み付け強度を調整する
+- Pong の性能低下要因を分析する
+- 報酬イベント以外の重要イベントも扱えるように拡張する
+- より大規模なモデル・環境で検証する
+- 複数 seed による統計的な評価を行う
+
+## 参考文献
+
+1. Yann LeCun, *A Path Towards Autonomous Machine Intelligence*, 2022.
+2. Danijar Hafner, Jurgis Pasukonis, Jimmy Ba, Timothy Lillicrap, *Mastering Diverse Domains through World Models*, Nature, 2025.
