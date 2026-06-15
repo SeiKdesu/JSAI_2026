@@ -1,12 +1,89 @@
-# Mastering Diverse Domains through World Models
+# Mastering Diverse Domains through World Models + RER
 
-A reimplementation of [DreamerV3][paper], a scalable and general reinforcement
-learning algorithm that masters a wide range of applications with fixed
-hyperparameters.
+This repository contains a reimplementation of [DreamerV3][paper] enhanced with **Reward-Event Contrastive Reconstruction (RER)**. DreamerV3 is a scalable reinforcement learning algorithm that masters diverse applications with fixed hyperparameters. RER is a proposed extension that improves learning efficiency by spatially reallocating reconstruction loss to reward-relevant regions.
 
 ![DreamerV3 Tasks](https://user-images.githubusercontent.com/2111293/217647148-cbc522e2-61ad-4553-8e14-1ecdc8d9438b.gif)
 
-If you find this code useful, please reference in your paper:
+## Reward-Event Contrastive Reconstruction (RER)
+
+Standard DreamerV3 applies uniform reconstruction loss across all pixels. In many environments (like Atari Breakout), reward-relevant objects like balls or bullets are tiny and their reconstruction loss is easily overwhelmed by the background.
+
+**RER** addresses this by:
+1.  **Extracting Reward-Event Priors**: Automatically identifying regions that change specifically during reward events compared to non-rewarding transitions.
+2.  **Spatial Loss Reallocation**: Weighting the reconstruction loss so the model focuses its capacity on these critical regions.
+3.  **Total Loss Preservation**: Normalizing weights to ensure the total reconstruction loss remains consistent with the baseline, avoiding confounding effects from simply increasing the loss scale.
+
+Experiments on Breakout show that RER can reduce reconstruction MSE for reward-relevant objects by ~29% and leads to faster score improvements as the "gate" for RER opens (typically after ~20 reward events).
+
+## Instructions
+
+The code requires Python 3.11+ and has been tested on Linux and macOS.
+
+### Setup
+
+Install dependencies:
+
+```sh
+pip install -U -r requirements.txt
+```
+
+### Running Experiments
+
+Use the provided helper script to run RER experiments or baselines:
+
+```sh
+# Smoke test (CPU, debug config, verify shape/logging)
+./run_reward_event_rec.sh smoke
+
+# Run Proposed Method (RER enabled)
+./run_reward_event_rec.sh proposed
+
+# Run Baseline (Standard DreamerV3)
+./run_reward_event_rec.sh baseline
+
+# Run Ablation (Baseline followed by Proposed on same seed)
+./run_reward_event_rec.sh ablation
+```
+
+You can override parameters via environment variables:
+```sh
+TASK=atari_pong SEED=1 ./run_reward_event_rec.sh proposed
+```
+
+### Hardware Constraints & Optimization
+
+If running on older GPUs like **RTX 1080 Ti** (Pascal architecture), use these flags to avoid OOM and compatibility issues:
+- `--jax.compute_dtype float32` (Pascal doesn't support bfloat16 hardware acceleration)
+- `--jax.prealloc False`
+- `--batch_size 8` (or lower)
+
+These are automatically handled if you use the default settings in `run_reward_event_rec.sh` or can be added to your manual command.
+
+### Visualization & Analysis
+
+- **Scope**: View scalar metrics and images.
+  ```sh
+  pip install -U scope
+  python -m scope.viewer --basedir ~/logdir/reward_event_rec --port 8000
+  ```
+- **RER Maps**: If `log_maps=True`, RER-specific heatmaps (`base_map`, `event_map`, `prior`) are logged to help verify spatial focusing.
+- **Verification Scripts**:
+  - `rer_visualize.py`: Visualize the RER heatmaps and loss distributions.
+  - `verify_reward_event_rec.py`: Unit tests for the RER logic.
+
+## Repository Structure
+
+- `dreamerv3/`: Core algorithm code.
+  - `agent.py`: Contains the RER implementation (search for `reward_event_rec`).
+  - `configs.yaml`: Default hyperparameters.
+- `embodied/`: Environment wrappers and infrastructure.
+- `rer_*.py`: Scripts for RER-specific experiments, ablations, and visualization.
+- `verify_*.py`: Verification and debugging scripts.
+- `run_reward_event_rec.sh`: Main entry point for experiments.
+
+## Citation
+
+If you find the DreamerV3 implementation useful, please cite the original paper:
 
 ```
 @article{hafner2025dreamerv3,
@@ -19,105 +96,10 @@ If you find this code useful, please reference in your paper:
 }
 ```
 
-To learn more:
+## Disclaimer
 
-- [Research paper][paper]
-- [Project website][website]
-- [Twitter summary][tweet]
+This repository is a reimplementation and extension of DreamerV3 based on the open-source DreamerV2 codebase. It is unrelated to Google or DeepMind.
 
-## DreamerV3
-
-DreamerV3 learns a world model from experiences and uses it to train an actor
-critic policy from imagined trajectories. The world model encodes sensory
-inputs into categorical representations and predicts future representations and
-rewards given actions.
-
-![DreamerV3 Method Diagram](https://user-images.githubusercontent.com/2111293/217355673-4abc0ce5-1a4b-4366-a08d-64754289d659.png)
-
-DreamerV3 masters a wide range of domains with a fixed set of hyperparameters,
-outperforming specialized methods. Removing the need for tuning reduces the
-amount of expert knowledge and computational resources needed to apply
-reinforcement learning.
-
-![DreamerV3 Benchmark Scores](https://github.com/danijar/dreamerv3/assets/2111293/0fe8f1cf-6970-41ea-9efc-e2e2477e7861)
-
-Due to its robustness, DreamerV3 shows favorable scaling properties. Notably,
-using larger models consistently increases not only its final performance but
-also its data-efficiency. Increasing the number of gradient steps further
-increases data efficiency.
-
-![DreamerV3 Scaling Behavior](https://user-images.githubusercontent.com/2111293/217356063-0cf06b17-89f0-4d5f-85a9-b583438c98dd.png)
-
-# Instructions
-
-The code has been tested on Linux and Mac and requires Python 3.11+.
-
-## Docker
-
-You can either use the provided `Dockerfile` that contains instructions or
-follow the manual instructions below.
-
-## Manual
-
-Install [JAX][jax] and then the other dependencies:
-
-```sh
-pip install -U -r requirements.txt
-```
-
-Training script:
-
-```sh
-python dreamerv3/main.py \
-  --logdir ~/logdir/dreamer/{timestamp} \
-  --configs crafter \
-  --run.train_ratio 32
-```
-
-To reproduce results, train on the desired task using the corresponding config,
-such as `--configs atari --task atari_pong`.
-
-View results:
-
-```sh
-pip install -U scope
-python -m scope.viewer --basedir ~/logdir --port 8000
-```
-
-Scalar metrics are also writting as JSONL files.
-
-# Tips
-
-- All config options are listed in `dreamerv3/configs.yaml` and you can
-  override them as flags from the command line.
-- The `debug` config block reduces the network size, batch size, duration
-  between logs, and so on for fast debugging (but does not learn a good model).
-- By default, the code tries to run on GPU. You can switch to CPU or TPU using
-  the `--jax.platform cpu` flag.
-- You can use multiple config blocks that will override defaults in the
-  order they are specified, for example `--configs crafter size50m`.
-- By default, metrics are printed to the terminal, appended to a JSON lines
-  file, and written as Scope summaries. Other outputs like WandB and
-  TensorBoard can be enabled in the training script.
-- If you get a `Too many leaves for PyTreeDef` error, it means you're
-  reloading a checkpoint that is not compatible with the current config. This
-  often happens when reusing an old logdir by accident.
-- If you are getting CUDA errors, scroll up because the cause is often just an
-  error that happened earlier, such as out of memory or incompatible JAX and
-  CUDA versions. Try `--batch_size 1` to rule out an out of memory error.
-- Many environments are included, some of which require installing additional
-  packages. See the `Dockerfile` for reference.
-- To continue stopped training runs, simply run the same command line again and
-  make sure that the `--logdir` points to the same directory.
-
-# Disclaimer
-
-This repository contains a reimplementation of DreamerV3 based on the open
-source DreamerV2 code base. It is unrelated to Google or DeepMind. The
-implementation has been tested to reproduce the official results on a range of
-environments.
-
-[jax]: https://github.com/google/jax#pip-installation-gpu-cuda
 [paper]: https://arxiv.org/pdf/2301.04104
 [website]: https://danijar.com/dreamerv3
 [tweet]: https://twitter.com/danijarh/status/1613161946223677441
